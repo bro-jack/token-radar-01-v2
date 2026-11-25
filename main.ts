@@ -53,6 +53,46 @@ try {
   process.exit(2);
 }
 const { board, radar } = buildRadar(snapshot);
+
+// Snapshot consistency: parseSnapshot checks each row on its own, but it
+// cannot see contradictions *between* fields, and a sealed snapshot built
+// from mismatched dates would otherwise fit and ship silently. Three
+// contradictions are impossible in real data, so all three refuse the run
+// with one readable line and exit 2, before any fitting happens:
+//   1. as_of is not a real calendar date. The format check in parseSnapshot
+//      only proves YYYY-MM-DD shape, so 2026-02-30 passes it and Date
+//      silently rolls it to 2026-03-02. The round-trip below catches that:
+//      the parsed date's UTC parts must equal the three components as typed.
+//   2. A protocol listed after as_of. listed_at later than the snapshot date
+//      would give the row a negative age, and the value model would score a
+//      protocol that did not exist yet on the snapshot date.
+//   3. A 7-day change of -100% or worse. change_7d is a percent move on a
+//      TVL that is positive (parseSnapshot enforces that), and a -100% move
+//      would mean the protocol's TVL is zero now, which it is not.
+function checkSnapshotConsistency(snapshot: Snapshot): string | null {
+  const [year, month, day] = snapshot.as_of.split('-').map(Number);
+  const asOf = new Date(`${snapshot.as_of}T00:00:00Z`);
+  if (asOf.getUTCFullYear() !== year || asOf.getUTCMonth() + 1 !== month || asOf.getUTCDate() !== day) {
+    return `snapshot.json's as_of ${snapshot.as_of} is not a real calendar date`;
+  }
+  const asOfMs = asOf.getTime();
+  for (const p of snapshot.protocols) {
+    if (p.listed_at === null) continue;
+    const listedMs = Date.parse(`${p.listed_at}T00:00:00Z`);
+    if (listedMs > asOfMs) {
+      return `snapshot.json's protocol ${p.slug} is listed ${p.listed_at}, after the snapshot date ${snapshot.as_of}`;
+    }
+    if (p.change_7d !== null && p.change_7d <= -100) {
+      return `snapshot.json's protocol ${p.slug} has a 7-day change of ${p.change_7d}%, impossible on a positive TVL`;
+    }
+  }
+  return null;
+}
+const consistencyIssue = checkSnapshotConsistency(snapshot);
+if (consistencyIssue !== null) {
+  process.stderr.write(`token radar: snapshot refused: ${consistencyIssue}\n`);
+  process.exit(2);
+}
 const issue = boardIssue(board, snapshot);
 if (issue !== null) {
   process.stderr.write(`token radar: the model wrote a board the gate refuses: ${issue}\n`);
