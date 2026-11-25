@@ -353,6 +353,16 @@ export function fitOls(points: { x: number; y: number }[]): { a: number; b: numb
 /** Multi-term OLS by normal equations + Gaussian elimination. Returns null on a
  *  singular design (a term with no variation in the training set). */
 export function fitMultiOls(X: number[][], y: number[]): number[] | null {
+  // A single non-finite feature poisons the whole fit instead of failing it:
+  // log(TVL) is -Infinity for a zero TVL, and the normal equations would then
+  // return NaN coefficients that score every row as NaN. Refusing the fit
+  // lets every caller fall back to something sane — olsPredict falls back to
+  // the log-TVL line, the bootstrap keeps the validated coefficients, and
+  // validateValue falls back to zeros — instead of shipping NaNs.
+  for (let i = 0; i < X.length; i++) {
+    for (let j = 0; j < X[i]!.length; j++) if (!Number.isFinite(X[i]![j]!)) return null;
+    if (!Number.isFinite(y[i]!)) return null;
+  }
   const k = X[0]!.length;
   const xtx: number[][] = Array.from({ length: k }, () => Array<number>(k).fill(0));
   const xty: number[] = Array<number>(k).fill(0);
@@ -1139,9 +1149,29 @@ export function parseSnapshot(text: string): Snapshot {
   const protocols = o.protocols.map((v, i) => {
     if (typeof v !== 'object' || v === null || Array.isArray(v)) throw new SnapshotError(`snapshot.json's protocol ${i} is not an object`);
     const p = v as Record<string, unknown>;
-    if (typeof p.slug !== 'string' || typeof p.name !== 'string' || typeof p.tvl_usd !== 'number' || !Number.isFinite(p.tvl_usd)) {
-      throw new SnapshotError(`snapshot.json's protocol ${i} lacks a slug, a name or a TVL`);
+    if (typeof p.slug !== 'string' || typeof p.name !== 'string') {
+      throw new SnapshotError(`snapshot.json's protocol ${i} lacks a slug or a name`);
     }
+    // A TVL of zero or less is not a small protocol, it is a corrupt row: the
+    // value model takes log(TVL), and log(0) is -Infinity, which would poison
+    // the OLS fit instead of failing loudly. The sealed snapshot's smallest
+    // TVL is $5,007,171, so this rejects nothing real.
+    if (typeof p.tvl_usd !== 'number' || !Number.isFinite(p.tvl_usd) || p.tvl_usd <= 0) {
+      throw new SnapshotError(`snapshot.json's protocol ${i} (${p.slug}) has no positive TVL`);
+    }
+    // A listed_at that does not parse is not "unknown age", it is a corrupt
+    // date: ageDays would silently return null and the row would be scored
+    // with the 365-day fallback. Refuse it so a typo'd snapshot cannot ship.
+    // The check mirrors ageDays' own parse, `${listed_at}T00:00:00Z`.
+    if (typeof p.listed_at === 'string' && !Number.isFinite(Date.parse(`${p.listed_at}T00:00:00Z`))) {
+      throw new SnapshotError(`snapshot.json's protocol ${i} (${p.slug}) has an unparseable listed_at ${JSON.stringify(p.listed_at)}`);
+    }
+    // A negative market cap is impossible, but it is deliberately NOT rejected
+    // here: one sealed row (autofinance) carries mcap_usd -1 with a gecko_id,
+    // so it is a has-token protocol either way, and isComp already keeps it
+    // out of the fit. Reclassifying it would move a ledger group and change
+    // the shipped bytes, so it is left exactly as recorded, not silently
+    // "fixed".
     return {
       slug: p.slug,
       name: p.name,
@@ -1155,6 +1185,21 @@ export function parseSnapshot(text: string): Snapshot {
       symbol: typeof p.symbol === 'string' ? p.symbol : null,
     };
   });
+  if (protocols.length === 0) throw new SnapshotError('snapshot.json has an empty protocols array: nothing to fit or rank');
+  // Two rows with one slug would collapse silently: boardIssue keys on a Set,
+  // so the second row would vanish from the coverage check while its TVL and
+  // age still fed the fit. The sealed snapshot has no duplicates.
+  const seenSlugs = new Set<string>();
+  for (const p of protocols) {
+    if (seenSlugs.has(p.slug)) throw new SnapshotError(`snapshot.json lists the slug ${p.slug} twice`);
+    seenSlugs.add(p.slug);
+  }
+  // A watchlist slug with no protocol behind it would only fail later, in
+  // boardIssue, after the whole model ran. Fail here, before any fitting, so
+  // the error names the snapshot, not the board.
+  const slugs = new Set(protocols.map((p) => p.slug));
+  const orphan = (o.watchlist as string[]).find((s) => !slugs.has(s));
+  if (orphan !== undefined) throw new SnapshotError(`snapshot.json's watchlist names ${orphan}, which is not in protocols`);
   return { as_of: o.as_of, source: o.source, floor_usd: o.floor_usd, protocols, watchlist: o.watchlist as string[] };
 }
 
