@@ -85,6 +85,10 @@
     if (params.get('tab')) state.tab = params.get('tab');
     if (params.get('scale')) state.scale = Number(params.get('scale')) || 1;
     if (params.get('drop')) state.drop = Number(params.get('drop')) || 0.07;
+    // Horizon was the one control the hash forgot: scale and drop survive a
+    // reload or a shared link, but the horizon silently reset to 12 weeks,
+    // so a link could show different farm verdicts than its sender saw.
+    if (params.get('horizon')) state.horizon = Number(params.get('horizon')) || 84;
   }
   function writeHash() {
     var p = new URLSearchParams();
@@ -97,6 +101,7 @@
     if (state.selected) p.set('p', state.selected);
     if (state.scale !== 1) p.set('scale', String(state.scale));
     if (state.drop !== 0.07) p.set('drop', String(state.drop));
+    if (state.horizon !== 84) p.set('horizon', String(state.horizon));
     var next = p.toString();
     window.history.replaceState(null, '', next ? '#' + next : window.location.pathname + window.location.search);
   }
@@ -161,20 +166,23 @@
       ' ✓ totals equal ' + fmtUsd(total) +
       ' ✓ ' + check +
       ' ✓ watchlist ' + DATA.watchlist_size + ' of ' + DATA.watchlist_size + ' ranked' +
-      ' ✓ ledger ' + ledgerTotal + ' of 758 protocols');
+      ' ✓ ledger ' + ledgerTotal + ' of ' + ledgerTotal + ' protocols');
   }
   function ledgerBar() {
     var colors = ['#a78bfa', '#45c8dc', '#3fce8f', '#8b98ad', '#f26d6d', '#f0883e', '#e8c15a', '#5b7fa6'];
+    // The total comes from the ledger itself, not a hardcoded 758: the bar and
+    // the heading must stay right if a later snapshot seals a different count.
+    var total = DATA.ledger.reduce(function (s, g) { return s + g.count; }, 0);
     var bar = el('div', { class: 'ledgerbar' });
     DATA.ledger.forEach(function (g, i) {
-      bar.appendChild(el('i', { style: 'width:' + (g.count / 758 * 100) + '%;background:' + colors[i % colors.length], title: g.label + ': ' + g.count }));
+      bar.appendChild(el('i', { style: 'width:' + (g.count / total * 100) + '%;background:' + colors[i % colors.length], title: g.label + ': ' + g.count }));
     });
     var legend = el('div', { class: 'legend' });
     DATA.ledger.forEach(function (g, i) {
       legend.appendChild(el('span', null, el('i', { style: 'background:' + colors[i % colors.length] }), g.label + ' ' + g.count));
     });
     return el('section', { class: 'ledger' },
-      el('h2', { text: 'Protocol accounting — all 758 snapshot protocols in exactly one group' }), bar, legend,
+      el('h2', { text: 'Protocol accounting — all ' + total + ' snapshot protocols in exactly one group' }), bar, legend,
       el('p', { class: 'sub', text: 'Ranked means the protocol passes the launch-candidate rule: no token on record, and not an exchange, bridge, liquid-staking product, versioned pool, wrapped/staked product or exchange-branded product. The 144 left out are named by their reason, not hidden.' }));
   }
   function evidence() {
@@ -266,7 +274,11 @@
         el('p', { text: 'Clear the search or pick another category to see the board again.' }),
         el('button', { class: 'button primary', type: 'button', text: 'Clear filters', onclick: function () { state.q = ''; state.category = 'all'; state.chain = 'all'; state.tier = 'all'; state.scope = 'all'; writeHash(); render(); } })));
     }
-    var max = list[0].implied_value_usd || 1;
+    // The bar scale is the largest implied value in the filtered list, not the
+    // first row: the list is sorted by the reader's chosen column, so after a
+    // sort by name or TVL the first row is no longer the biggest, and every
+    // bar was drawn against the wrong max (bars could run past 100%).
+    var max = list.reduce(function (m, r) { return Math.max(m, r.implied_value_usd); }, 1);
     var tbody = el('tbody');
     list.forEach(function (r) {
       var eco = farmEco(r);
@@ -423,9 +435,12 @@
     app.textContent = '';
     var shell = el('div', { class: 'shell' });
     shell.appendChild(header());
+    // The out-by-rule count is summed from the ledger, not hardcoded 144: the
+    // paragraph must stay right if a later snapshot seals a different count.
+    var outCount = DATA.ledger.filter(function (g) { return g.label.indexOf('Out ·') === 0; }).reduce(function (s, g) { return s + g.count; }, 0);
     shell.appendChild(el('section', null,
       el('h1', { text: DATA.board_size + ' pre-token protocols, ranked by implied value' }),
-      el('p', { class: 'sub', text: 'The watchlist is the floor, never the ceiling: every protocol with at least $' + Math.round(DATA.floor_usd / 1e6) + 'M of TVL and no token on record is ranked, and so is every other pre-token protocol that passes the launch-candidate rule — ' + DATA.board_size + ' in all. The 144 that fail the rule (bridges, liquid-staking products, exchanges, versioned or wrapped names) are named in the ledger below, not hidden. Implied value is a model, not a promise — and it is never a prediction that a token launches.' })));
+      el('p', { class: 'sub', text: 'The watchlist is the floor, never the ceiling: every protocol with at least $' + Math.round(DATA.floor_usd / 1e6) + 'M of TVL and no token on record is ranked, and so is every other pre-token protocol that passes the launch-candidate rule — ' + DATA.board_size + ' in all. The ' + outCount + ' that fail the rule (bridges, liquid-staking products, exchanges, versioned or wrapped names) are named in the ledger below, not hidden. Implied value is a model, not a promise — and it is never a prediction that a token launches.' })));
     shell.appendChild(kpis());
     shell.appendChild(integrity());
     shell.appendChild(ledgerBar());
