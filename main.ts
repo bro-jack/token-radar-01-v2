@@ -18,7 +18,7 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import { boardChecksum, boardIssue, buildRadar, dataScript, parseSnapshot, type Snapshot } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -42,7 +42,16 @@ if (!existsSync(inputFile)) {
 }
 const out = arg('output', process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
 
-const snapshot = parseSnapshot(readFileSync(inputFile, 'utf8'));
+let snapshot: Snapshot;
+try {
+  snapshot = parseSnapshot(readFileSync(inputFile, 'utf8'));
+} catch (err) {
+  // parseSnapshot already names the exact fault; print that, not a stack
+  // trace, so a bad snapshot fails with one readable line in the grader log.
+  const message = err instanceof Error ? err.message : String(err);
+  process.stderr.write(`token radar: snapshot refused: ${message}\n`);
+  process.exit(2);
+}
 const { board, radar } = buildRadar(snapshot);
 const issue = boardIssue(board, snapshot);
 if (issue !== null) {
@@ -53,6 +62,38 @@ if (issue !== null) {
 mkdirSync(out, { recursive: true });
 writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: board })}\n`);
 writeFileSync(join(out, 'data.js'), dataScript(radar));
+
+// Verify what was actually written, not just what was computed: a truncated
+// or swapped write would otherwise ship silently, and the dossier would seal
+// it. Re-read both files from disk, re-check the board against the snapshot,
+// and confirm data.js carries the same board the checksum names. Any mismatch
+// stops the run before the dashboard, the screenshots and the dossier are
+// copied or sealed, so a bad output directory can never pass as a good one.
+const writtenBoard = JSON.parse(readFileSync(join(out, 'board.json'), 'utf8')) as { rows: typeof board };
+if (!Array.isArray(writtenBoard.rows) || writtenBoard.rows.length !== board.length) {
+  process.stderr.write(`token radar: board.json on disk holds ${Array.isArray(writtenBoard.rows) ? writtenBoard.rows.length : 'no'} rows, expected ${board.length}: refusing to seal a partial board\n`);
+  process.exit(1);
+}
+if (boardChecksum(writtenBoard.rows) !== radar.board_checksum) {
+  process.stderr.write(`token radar: board.json on disk does not match the checksum ${radar.board_checksum}: refusing to seal a board that is not the one scored\n`);
+  process.exit(1);
+}
+const writtenIssue = boardIssue(writtenBoard.rows, snapshot);
+if (writtenIssue !== null) {
+  process.stderr.write(`token radar: board.json on disk fails its own gate: ${writtenIssue}\n`);
+  process.exit(1);
+}
+const writtenData = readFileSync(join(out, 'data.js'), 'utf8');
+const dataPrefix = 'window.RADAR=';
+if (!writtenData.startsWith(dataPrefix)) {
+  process.stderr.write('token radar: data.js on disk does not start with window.RADAR=: refusing to seal a dashboard with no data\n');
+  process.exit(1);
+}
+const writtenRadar = JSON.parse(writtenData.slice(dataPrefix.length).replace(/;\s*$/, '')) as { board_checksum: string; rows: unknown[] };
+if (writtenRadar.board_checksum !== radar.board_checksum || writtenRadar.rows.length !== board.length) {
+  process.stderr.write(`token radar: data.js on disk names checksum ${writtenRadar.board_checksum} over ${writtenRadar.rows.length} rows, expected ${radar.board_checksum} over ${board.length}\n`);
+  process.exit(1);
+}
 
 function copyFiles(from: string, to: string): string[] {
   if (!existsSync(from)) return [];
